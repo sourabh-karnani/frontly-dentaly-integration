@@ -6,14 +6,43 @@ import {
   getPracticeConfig,
   getPractitionersByRole,
   getAvailability,
+  listPatientAppointments,
+  updateAppointment,
   bookAppointment,
   searchPatients,
-  getFirstPaymentPlan,
+  getSiteDefaultPaymentPlanId,
   registerPatient,
+  updatePatient,
   DentallyApiError,
 } from '../services/dentally.service.js';
 
 const router = Router();
+
+// ============================================================================
+// Round Robin State (in-memory, resets on restart)
+// Key: `${frontly_practice_id}:${practitioner_type}` → next index
+// ============================================================================
+
+const rrCounters = new Map();
+
+function pickRoundRobin(key, ids) {
+  const idx = rrCounters.get(key) ?? 0;
+  const picked = ids[idx % ids.length];
+  rrCounters.set(key, idx + 1);
+  return picked;
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function splitName(name) {
+  if (!name) return { firstName: 'Unknown', lastName: 'Patient' };
+  const parts = name.trim().split(/\s+/);
+  return parts.length === 1
+    ? { firstName: parts[0], lastName: 'Patient' }
+    : { firstName: parts[0], lastName: parts.slice(1).join(' ') };
+}
 
 // ============================================================================
 // Validation Schemas
@@ -49,6 +78,52 @@ const bookSchema = z.object({
   state:               z.enum(DENTALLY_STATES).optional(),
   notes:               z.string().optional(),
 });
+
+const listAppointmentsSchema = z.object({
+  business_identifier: z.string().min(1, 'business_identifier is required'),
+  phone:               z.string().optional(),
+  name:                z.string().optional(),
+});
+
+const rescheduleSchema = z.object({
+  business_identifier: z.string().min(1, 'business_identifier is required'),
+  appointment_id:      z.number().int().positive('appointment_id is required'),
+  start_time:          z.string().min(1, 'start_time is required'),
+  finish_time:         z.string().min(1, 'finish_time is required'),
+  practitioner_id:     z.number().int().positive().optional(),
+});
+
+const cancelSchema = z.object({
+  business_identifier: z.string().min(1, 'business_identifier is required'),
+  appointment_id:      z.number().int().positive('appointment_id is required'),
+});
+
+const updatePatientSchema = z.object({
+  business_identifier: z.string().min(1, 'business_identifier is required'),
+  phone:               z.string().optional(),
+  name:                z.string().optional(),
+  // Update fields — all optional, send only what needs changing
+  title:               z.enum(PATIENT_TITLES).optional(),
+  first_name:          z.string().optional(),
+  last_name:           z.string().optional(),
+  middle_name:         z.string().optional(),
+  date_of_birth:       z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  gender:              z.enum(['male', 'female']).optional(),
+  address_line_1:      z.string().optional(),
+  address_line_2:      z.string().optional(),
+  town:                z.string().optional(),
+  county:              z.string().optional(),
+  postcode:            z.string().optional(),
+  mobile_phone:        z.string().optional(),
+  email_address:       z.string().email().optional(),
+  home_phone:          z.string().optional(),
+  recall_method:       z.enum(['Letter', 'SMS', 'Email', 'Phone']).optional(),
+  use_email:           z.boolean().optional(),
+  use_sms:             z.boolean().optional(),
+}).refine(
+  (d) => d.phone !== undefined || d.name !== undefined,
+  { message: 'Either phone or name is required to look up the patient', path: ['phone'] }
+);
 
 const registerPatientSchema = z.object({
   business_identifier: z.string().min(1, 'business_identifier is required'),
@@ -118,14 +193,14 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
     if (params.practitioner_id !== undefined) {
       practitionerIds = [params.practitioner_id];
     } else {
-      practitionerIds = await getPractitionersByRole(
+      const allIds = await getPractitionersByRole(
         practice.dentally_api_key,
         practice.user_agent,
         practice.dentally_site_id,
         params.practitioner_type
       );
 
-      if (practitionerIds.length === 0) {
+      if (allIds.length === 0) {
         return res.status(404).json({
           success: false,
           error: 'Not Found',
@@ -133,6 +208,12 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
           code: 'NO_PRACTITIONERS_FOUND',
         });
       }
+
+      // Round robin: pick one practitioner per request to keep availability slots attributable
+      const rrKey = `${practice.frontly_practice_id}:${params.practitioner_type}`;
+      const pickedId = pickRoundRobin(rrKey, allIds);
+      practitionerIds = [pickedId];
+      logger.info({ rrKey, allIds, pickedId }, 'Round robin practitioner selected');
     }
 
     const availability = await getAvailability(practice.dentally_api_key, practice.user_agent, {
@@ -144,7 +225,7 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
 
     logger.info({ business_identifier: params.business_identifier, practitionerIds }, 'Availability fetched successfully');
 
-    return res.json(availability);
+    return res.json({ ...availability, practitioner_id: practitionerIds[0] });
   } catch (error) {
     return handleError(error, res, next);
   }
@@ -168,7 +249,7 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
 router.post('/book', requireApiKey, async (req, res, next) => {
   try {
     const params = bookSchema.parse(req.body);
-
+    console.log("------------- PHONE : --------", params.phone)
     const practice = await getPracticeConfig(params.business_identifier);
 
     // ── Patient lookup ──────────────────────────────────────────────────────
@@ -199,7 +280,27 @@ router.post('/book', requireApiKey, async (req, res, next) => {
     }
 
     if (patientId === undefined) {
-      logger.info({ phone: params.phone, name: params.name }, 'No patient match — booking without patient_id');
+      // No existing patient found — create a placeholder so the appointment is always linked
+      logger.info({ phone: params.phone, name: params.name }, 'No patient match — creating placeholder patient');
+
+      const { firstName, lastName } = splitName(params.name);
+      const paymentPlanId = await getSiteDefaultPaymentPlanId(practice.dentally_api_key, practice.user_agent, practice.dentally_site_id);
+
+      const newPatient = await registerPatient(practice.dentally_api_key, practice.user_agent, {
+        title:        'Mr',
+        firstName,
+        lastName,
+        dateOfBirth:  '1900-01-01',
+        gender:       true,
+        addressLine1: 'Not provided',
+        postcode:     'SW1A 1AA',
+        siteId:       practice.dentally_site_id,
+        paymentPlanId,
+        mobilePhone:  params.phone,
+      });
+
+      patientId = newPatient?.patient?.id;
+      logger.info({ patientId, firstName, lastName }, 'Placeholder patient created');
     }
     // ────────────────────────────────────────────────────────────────────────
 
@@ -218,7 +319,7 @@ router.post('/book', requireApiKey, async (req, res, next) => {
       'Appointment booked successfully'
     );
 
-    return res.status(201).json(appointment);
+    return res.status(201).json({ ...appointment, patient_id: patientId });
   } catch (error) {
     return handleError(error, res, next);
   }
@@ -270,6 +371,239 @@ router.post('/register-patient', requireApiKey, async (req, res, next) => {
     );
 
     return res.status(201).json(patient);
+  } catch (error) {
+    return handleError(error, res, next);
+  }
+});
+
+/**
+ * GET /dentally/appointments
+ *
+ * Lists all appointments for a patient. Patient is resolved by phone or name.
+ * Returns 404 if no patient is found (no placeholder creation).
+ *
+ * @query {string} business_identifier
+ * @query {string} [phone]
+ * @query {string} [name]
+ */
+router.get('/appointments', requireApiKey, async (req, res, next) => {
+  try {
+    const params = listAppointmentsSchema.parse(req.query);
+
+    const practice = await getPracticeConfig(params.business_identifier);
+
+    // ── Patient lookup (no placeholder creation) ────────────────────────────
+    let patientId;
+
+    if (params.phone) {
+      const results = await searchPatients(practice.dentally_api_key, practice.user_agent, {
+        query: params.phone,
+        siteId: practice.dentally_site_id,
+      });
+      if (results.length > 0) {
+        patientId = results[0].id;
+        logger.info({ patientId, phone: params.phone }, 'Patient matched by phone');
+      }
+    }
+
+    if (patientId === undefined && params.name) {
+      const results = await searchPatients(practice.dentally_api_key, practice.user_agent, {
+        query: params.name,
+        siteId: practice.dentally_site_id,
+      });
+      if (results.length === 1) {
+        patientId = results[0].id;
+        logger.info({ patientId, name: params.name }, 'Patient matched by name');
+      } else if (results.length > 1) {
+        logger.info({ name: params.name, count: results.length }, 'Multiple patients matched — cannot determine unique patient');
+      }
+    }
+
+    if (patientId === undefined) {
+      return res.status(404).json({
+        success: false,
+        error: 'Not Found',
+        message: 'No patient found matching the provided phone or name',
+        code: 'PATIENT_NOT_FOUND',
+      });
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
+    const appointments = await listPatientAppointments(practice.dentally_api_key, practice.user_agent, {
+      patientId,
+      siteId: practice.dentally_site_id,
+    });
+
+    logger.info({ business_identifier: params.business_identifier, patientId }, 'Patient appointments fetched successfully');
+
+    return res.json(appointments);
+  } catch (error) {
+    return handleError(error, res, next);
+  }
+});
+
+/**
+ * POST /dentally/reschedule
+ *
+ * Reschedules an existing appointment by updating its times and optionally its practitioner.
+ * Edits the appointment in-place — preserves appointment ID, history, and patient linkage.
+ *
+ * @body {string} business_identifier
+ * @body {number} appointment_id
+ * @body {string} start_time          - New start time (ISO 8601)
+ * @body {string} finish_time         - New finish time (ISO 8601)
+ * @body {number} [practitioner_id]   - New practitioner (optional)
+ */
+router.post('/reschedule', requireApiKey, async (req, res, next) => {
+  try {
+    const params = rescheduleSchema.parse(req.body);
+
+    const practice = await getPracticeConfig(params.business_identifier);
+
+    const fields = {
+      start_time:  params.start_time,
+      finish_time: params.finish_time,
+    };
+    if (params.practitioner_id !== undefined) fields.practitioner_id = params.practitioner_id;
+
+    const appointment = await updateAppointment(
+      practice.dentally_api_key,
+      practice.user_agent,
+      params.appointment_id,
+      fields
+    );
+
+    logger.info(
+      { business_identifier: params.business_identifier, appointment_id: params.appointment_id },
+      'Appointment rescheduled successfully'
+    );
+
+    return res.json(appointment);
+  } catch (error) {
+    return handleError(error, res, next);
+  }
+});
+
+/**
+ * POST /dentally/cancel
+ *
+ * Cancels an appointment by setting its state to "Cancelled".
+ *
+ * @body {string} business_identifier
+ * @body {number} appointment_id
+ */
+router.post('/cancel', requireApiKey, async (req, res, next) => {
+  try {
+    const params = cancelSchema.parse(req.body);
+
+    const practice = await getPracticeConfig(params.business_identifier);
+
+    const appointment = await updateAppointment(
+      practice.dentally_api_key,
+      practice.user_agent,
+      params.appointment_id,
+      { state: 'Cancelled' }
+    );
+
+    logger.info(
+      { business_identifier: params.business_identifier, appointment_id: params.appointment_id },
+      'Appointment cancelled successfully'
+    );
+
+    return res.json(appointment);
+  } catch (error) {
+    return handleError(error, res, next);
+  }
+});
+
+/**
+ * POST /dentally/update-patient
+ *
+ * Updates an existing Dentally patient. Patient is resolved by phone or name.
+ * Returns 404 if no patient found. Only provided fields are updated.
+ *
+ * @body {string}  business_identifier
+ * @body {string}  [phone]              - Used for patient lookup
+ * @body {string}  [name]               - Fallback lookup (exact 1 match only)
+ * @body {string}  [title]
+ * @body {string}  [first_name]
+ * @body {string}  [last_name]
+ * @body {string}  [date_of_birth]      - YYYY-MM-DD
+ * @body {string}  [gender]             - "male" | "female"
+ * @body {string}  [address_line_1]
+ * @body {string}  [address_line_2]
+ * @body {string}  [town]
+ * @body {string}  [county]
+ * @body {string}  [postcode]
+ * @body {string}  [mobile_phone]
+ * @body {string}  [email_address]
+ * @body {string}  [home_phone]
+ * @body {string}  [recall_method]      - "Letter" | "SMS" | "Email" | "Phone"
+ * @body {boolean} [use_email]
+ * @body {boolean} [use_sms]
+ */
+router.post('/update-patient', requireApiKey, async (req, res, next) => {
+  try {
+    const params = updatePatientSchema.parse(req.body);
+
+    const practice = await getPracticeConfig(params.business_identifier);
+
+    // ── Patient lookup (no placeholder creation) ────────────────────────────
+    let patientId;
+
+    if (params.phone) {
+      const results = await searchPatients(practice.dentally_api_key, practice.user_agent, {
+        query: params.phone,
+        siteId: practice.dentally_site_id,
+      });
+      if (results.length > 0) {
+        patientId = results[0].id;
+        logger.info({ patientId, phone: params.phone }, 'Patient matched by phone');
+      }
+    }
+
+    if (patientId === undefined && params.name) {
+      const results = await searchPatients(practice.dentally_api_key, practice.user_agent, {
+        query: params.name,
+        siteId: practice.dentally_site_id,
+      });
+      if (results.length === 1) {
+        patientId = results[0].id;
+        logger.info({ patientId, name: params.name }, 'Patient matched by name');
+      } else if (results.length > 1) {
+        logger.info({ name: params.name, count: results.length }, 'Multiple patients matched — cannot determine unique patient');
+      }
+    }
+
+    if (patientId === undefined) {
+      return res.status(404).json({
+        success: false,
+        error: 'Not Found',
+        message: 'No patient found matching the provided phone or name',
+        code: 'PATIENT_NOT_FOUND',
+      });
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
+    // Build update payload — only fields explicitly provided by the caller
+    const UPDATE_FIELDS = ['title', 'first_name', 'last_name', 'middle_name', 'date_of_birth',
+      'address_line_1', 'address_line_2', 'town', 'county', 'postcode',
+      'mobile_phone', 'email_address', 'home_phone', 'recall_method', 'use_email', 'use_sms'];
+
+    const fields = {};
+    for (const key of UPDATE_FIELDS) {
+      if (params[key] !== undefined) fields[key] = params[key];
+    }
+    if (params.gender !== undefined) fields.gender = params.gender === 'male';
+
+    const patient = await updatePatient(practice.dentally_api_key, practice.user_agent, patientId, fields);
+
+    logger.info(
+      { business_identifier: params.business_identifier, patientId, updatedFields: Object.keys(fields) },
+      'Patient updated successfully'
+    );
+
+    return res.json(patient);
   } catch (error) {
     return handleError(error, res, next);
   }
