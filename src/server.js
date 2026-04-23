@@ -36,6 +36,10 @@ const start = async () => {
       logger.info(`Book appointment:     POST http://localhost:${env.port}/dentally/book`);
       logger.info(`Register patient:     POST http://localhost:${env.port}/dentally/register-patient`);
       logger.info(`Register business:    POST http://localhost:${env.port}/business/register`);
+      logger.info(`List appointments:    GET  http://localhost:${env.port}/dentally/appointments`);
+      logger.info(`Reschedule:           POST http://localhost:${env.port}/dentally/reschedule`);
+      logger.info(`Cancel:               POST http://localhost:${env.port}/dentally/cancel`);
+      logger.info(`Update patient:       POST http://localhost:${env.port}/dentally/update-patient`);
     });
 
     server.on('error', (error) => {

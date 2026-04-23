@@ -124,6 +124,43 @@ export async function getAvailability(apiKey, userAgent, { practitionerIds, star
   return data;
 }
 
+export async function listPatientAppointments(apiKey, userAgent, { patientId, siteId }) {
+  const query = new URLSearchParams({ patient_id: patientId });
+  if (siteId) query.set('site_id', siteId);
+
+  const url = `${BASE_URL}/v1/appointments?${query}`;
+
+  const { ok, status, data } = await dentallyFetch('listPatientAppointments', url, apiKey, userAgent);
+
+  if (!ok) {
+    logger.error({ patientId, status, body: data }, 'Dentally list patient appointments failed');
+    throw new DentallyApiError(status, (data && data.message) || 'Failed to fetch appointments from Dentally');
+  }
+
+  return data;
+}
+
+export async function updateAppointment(apiKey, userAgent, appointmentId, fields) {
+  const { ok, status, data } = await dentallyFetch(
+    'updateAppointment',
+    `${BASE_URL}/v1/appointments/${appointmentId}`,
+    apiKey,
+    userAgent,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ appointment: fields }),
+    }
+  );
+
+  if (!ok) {
+    logger.error({ appointmentId, fields, status, body: data }, 'Dentally update appointment failed');
+    throw new DentallyApiError(status, (data && data.message) || 'Failed to update appointment in Dentally');
+  }
+
+  return data;
+}
+
 export async function bookAppointment(apiKey, userAgent, { startTime, finishTime, practitionerId, reason, patientId, state, notes }) {
   const appointment = {
     start_time: startTime,
@@ -157,25 +194,25 @@ export async function bookAppointment(apiKey, userAgent, { startTime, finishTime
 }
 
 // ============================================================================
-// Payment Plan Endpoints
+// Site Endpoints
 // ============================================================================
 
-export async function getFirstPaymentPlan(apiKey, userAgent) {
-  const url = `${BASE_URL}/v1/payment_plans?active=true`;
+export async function getSiteDefaultPaymentPlanId(apiKey, userAgent, siteId) {
+  const url = `${BASE_URL}/v1/sites/${encodeURIComponent(siteId)}`;
 
-  const { ok, status, data } = await dentallyFetch('getFirstPaymentPlan', url, apiKey, userAgent);
+  const { ok, status, data } = await dentallyFetch('getSiteDefaultPaymentPlanId', url, apiKey, userAgent);
 
   if (!ok) {
-    logger.error({ status, body: data }, 'Dentally get payment plans failed');
-    throw new DentallyApiError(status, (data && data.message) || 'Failed to fetch payment plans from Dentally');
+    logger.error({ siteId, status, body: data }, 'Dentally get site failed');
+    throw new DentallyApiError(status, (data && data.message) || 'Failed to fetch site from Dentally');
   }
 
-  const plans = data?.payment_plans;
-  if (!plans || plans.length === 0) {
-    throw new DentallyApiError(502, 'No active payment plans found for this practice', 'NO_PAYMENT_PLANS');
+  const paymentPlanId = data?.site?.default_payment_plan_id;
+  if (!paymentPlanId) {
+    throw new DentallyApiError(502, `No default payment plan configured for site: ${siteId}`, 'NO_DEFAULT_PAYMENT_PLAN');
   }
 
-  return plans[0].id;
+  return paymentPlanId;
 }
 
 // ============================================================================
@@ -187,7 +224,7 @@ export async function searchPatients(apiKey, userAgent, { query, siteId }) {
   if (siteId) params.set('site_id', siteId);
 
   const url = `${BASE_URL}/v1/patients?${params}`;
-
+  console.log(" ----------- URL : ", url)
   const { ok, status, data } = await dentallyFetch('searchPatients', url, apiKey, userAgent);
 
   if (!ok) {
@@ -196,6 +233,27 @@ export async function searchPatients(apiKey, userAgent, { query, siteId }) {
   }
 
   return data?.patients ?? [];
+}
+
+export async function updatePatient(apiKey, userAgent, patientId, fields) {
+  const { ok, status, data } = await dentallyFetch(
+    'updatePatient',
+    `${BASE_URL}/v1/patients/${patientId}`,
+    apiKey,
+    userAgent,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ patient: fields }),
+    }
+  );
+
+  if (!ok) {
+    logger.error({ patientId, fields, status, body: data }, 'Dentally update patient failed');
+    throw new DentallyApiError(status, (data && data.message) || 'Failed to update patient in Dentally');
+  }
+
+  return data;
 }
 
 export async function registerPatient(apiKey, userAgent, { title, firstName, lastName, dateOfBirth, gender, addressLine1, postcode, siteId, paymentPlanId, mobilePhone, emailAddress }) {

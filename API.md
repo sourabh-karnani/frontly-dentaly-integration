@@ -114,6 +114,8 @@ GET /dentally/availability
 
 Fetches available appointment slots from Dentally for a given practitioner and time window.
 
+When `practitioner_type` is used and resolves to multiple practitioners, a **round robin** algorithm picks one per request — ensuring returned slots are always attributable to a single practitioner.
+
 **Headers**
 ```
 x-api-key: <API_KEY>
@@ -125,8 +127,8 @@ x-api-key: <API_KEY>
 | `business_identifier` | string | ✅ | Identifies the practice in the microservice DB |
 | `start_time` | string (ISO 8601) | ✅ | Start of the search window. Must be in the future |
 | `finish_time` | string (ISO 8601) | ✅ | End of the search window. Must be after `start_time` |
-| `practitioner_id` | integer | ✅ or `practitioner_type` | Dentally practitioner ID. If provided, skips practitioner lookup |
-| `practitioner_type` | string | ✅ or `practitioner_id` | `"dentist"` \| `"hygienist"` \| `"therapist"`. Resolved to IDs via Dentally API |
+| `practitioner_id` | integer | ✅ or `practitioner_type` | Dentally practitioner ID. If provided, skips practitioner lookup and round robin |
+| `practitioner_type` | string | ✅ or `practitioner_id` | `"dentist"` \| `"hygienist"` \| `"therapist"`. Resolved via Dentally, round robin applied |
 | `duration` | integer | ❌ | Minimum slot duration in minutes. Defaults to practice minimum (usually 5 min) |
 
 > Either `practitioner_id` or `practitioner_type` must be provided, not neither.
@@ -177,12 +179,14 @@ curl -X GET "http://localhost:3001/dentally/availability?business_identifier=%2B
 POST /dentally/book
 ```
 
-Books an appointment in Dentally. Optionally resolves a patient by phone or name and links them. Can be booked without a patient (placeholder booking).
+Books an appointment in Dentally. Resolves a patient by phone or name and links them. If no patient is found, a placeholder patient is automatically created and linked.
 
-**Patient lookup logic:**
+**Patient lookup + creation logic:**
 1. If `phone` provided → search Dentally by phone → first match wins
-2. If no phone match and `name` provided → search by name → only used if exactly **1** result (multiple = ambiguous, skip)
-3. If no match or neither provided → book without `patient_id`
+2. If no phone match and `name` provided → search by name → only used if exactly **1** result (multiple = ambiguous)
+3. If no match or neither provided → create placeholder patient (`first_name` / `last_name` split from `name` param or `"Unknown Patient"`, hardcoded DOB / address / postcode)
+
+The appointment is **always** linked to a patient.
 
 **Headers**
 ```
@@ -232,9 +236,142 @@ curl -X POST "http://localhost:3001/dentally/book" \
     "state": "Pending",
     "reason": "Exam",
     "duration": 30
-  }
+  },
+  "patient_id": 1001
 }
 ```
+
+---
+
+### List Patient Appointments
+
+```
+GET /dentally/appointments
+```
+
+Returns all Dentally appointments for a patient. Patient is resolved by phone or name — returns `404` if no match (no placeholder created).
+
+**Headers**
+```
+x-api-key: <API_KEY>
+```
+
+**Query Parameters**
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `business_identifier` | string | ✅ | Identifies the practice |
+| `phone` | string | ✅ or `name` | Patient phone for lookup |
+| `name` | string | ✅ or `phone` | Patient name fallback (exact 1 match only) |
+
+**Example**
+```bash
+curl -X GET "http://localhost:3001/dentally/appointments?business_identifier=%2B447911123456&phone=07123456789" \
+  -H "x-api-key: your-api-key"
+```
+
+**Response `200`**
+```json
+{
+  "appointments": [
+    {
+      "id": 14493,
+      "start_time": "2026-05-02T09:00:00.000+00:00",
+      "finish_time": "2026-05-02T09:30:00.000+00:00",
+      "state": "Pending",
+      "reason": "Exam",
+      "practitioner_id": 1,
+      "patient_id": 1001
+    }
+  ],
+  "meta": { "total": 1, "page": 1 }
+}
+```
+
+**Response `404`** — patient not found
+```json
+{
+  "success": false,
+  "error": "Not Found",
+  "message": "No patient found matching the provided phone or name",
+  "code": "PATIENT_NOT_FOUND"
+}
+```
+
+---
+
+### Reschedule Appointment
+
+```
+POST /dentally/reschedule
+```
+
+Updates an existing appointment's times and optionally its practitioner in-place. Preserves appointment ID, history, and patient linkage.
+
+**Headers**
+```
+x-api-key: <API_KEY>
+Content-Type: application/json
+```
+
+**Request Body**
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `business_identifier` | string | ✅ | Identifies the practice |
+| `appointment_id` | integer | ✅ | Dentally appointment ID |
+| `start_time` | string (ISO 8601) | ✅ | New appointment start |
+| `finish_time` | string (ISO 8601) | ✅ | New appointment end |
+| `practitioner_id` | integer | ❌ | New practitioner (omit to keep existing) |
+
+**Example**
+```bash
+curl -X POST "http://localhost:3001/dentally/reschedule" \
+  -H "x-api-key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "business_identifier": "+447911123456",
+    "appointment_id": 14493,
+    "start_time": "2026-05-03T10:00:00Z",
+    "finish_time": "2026-05-03T10:30:00Z",
+    "practitioner_id": 2
+  }'
+```
+
+**Response `200`** — updated appointment object
+
+---
+
+### Cancel Appointment
+
+```
+POST /dentally/cancel
+```
+
+Cancels an appointment by setting its state to `"Cancelled"`.
+
+**Headers**
+```
+x-api-key: <API_KEY>
+Content-Type: application/json
+```
+
+**Request Body**
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `business_identifier` | string | ✅ | Identifies the practice |
+| `appointment_id` | integer | ✅ | Dentally appointment ID |
+
+**Example**
+```bash
+curl -X POST "http://localhost:3001/dentally/cancel" \
+  -H "x-api-key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "business_identifier": "+447911123456",
+    "appointment_id": 14493
+  }'
+```
+
+**Response `200`** — appointment object with `state: "Cancelled"` and `cancelled_at` timestamp populated
 
 ---
 
@@ -244,7 +381,7 @@ curl -X POST "http://localhost:3001/dentally/book" \
 POST /dentally/register-patient
 ```
 
-Creates a new patient record in Dentally. `payment_plan_id` is resolved automatically from the first active payment plan. `ethnicity` is hardcoded to `"99"` (not stated).
+Creates a new patient record in Dentally. `payment_plan_id` is resolved automatically from the site's `default_payment_plan_id` (`GET /v1/sites/{site_id}`). `ethnicity` is hardcoded to `"99"` (not stated).
 
 **Headers**
 ```
@@ -299,6 +436,73 @@ curl -X POST "http://localhost:3001/dentally/register-patient" \
     "payment_plan_id": 139780,
     "active": true
   }
+}
+```
+
+---
+
+### Update Patient
+
+```
+POST /dentally/update-patient
+```
+
+Updates fields on an existing Dentally patient. Patient is resolved by phone or name — returns `404` if no match. Only fields explicitly provided in the request body are updated.
+
+**Headers**
+```
+x-api-key: <API_KEY>
+Content-Type: application/json
+```
+
+**Request Body**
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `business_identifier` | string | ✅ | Identifies the practice |
+| `phone` | string | ✅ or `name` | Used for patient lookup |
+| `name` | string | ✅ or `phone` | Fallback lookup (exact 1 match only) |
+| `title` | string | ❌ | `"Mr"` \| `"Mrs"` \| `"Miss"` \| `"Ms"` \| `"Dr"` \| ... |
+| `first_name` | string | ❌ | |
+| `last_name` | string | ❌ | |
+| `middle_name` | string | ❌ | |
+| `date_of_birth` | string | ❌ | `YYYY-MM-DD` |
+| `gender` | string | ❌ | `"male"` \| `"female"` |
+| `address_line_1` | string | ❌ | |
+| `address_line_2` | string | ❌ | |
+| `town` | string | ❌ | |
+| `county` | string | ❌ | |
+| `postcode` | string | ❌ | |
+| `mobile_phone` | string | ❌ | |
+| `email_address` | string | ❌ | Valid email |
+| `home_phone` | string | ❌ | |
+| `recall_method` | string | ❌ | `"Letter"` \| `"SMS"` \| `"Email"` \| `"Phone"` |
+| `use_email` | boolean | ❌ | |
+| `use_sms` | boolean | ❌ | |
+
+**Example**
+```bash
+curl -X POST "http://localhost:3001/dentally/update-patient" \
+  -H "x-api-key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "business_identifier": "+447911123456",
+    "phone": "07123456789",
+    "first_name": "Jonathan",
+    "email_address": "jonathan.smith@email.com",
+    "address_line_1": "42 New Street",
+    "postcode": "W1B 2AA"
+  }'
+```
+
+**Response `200`** — full updated patient object
+
+**Response `404`** — patient not found
+```json
+{
+  "success": false,
+  "error": "Not Found",
+  "message": "No patient found matching the provided phone or name",
+  "code": "PATIENT_NOT_FOUND"
 }
 ```
 
