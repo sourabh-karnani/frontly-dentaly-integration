@@ -10,7 +10,7 @@ const logger = pino({
     ? {
         target: 'pino-pretty',
         options: {
-          colorize: true,
+          colorize: !!process.stdout.isTTY,
           translateTime: 'SYS:standard',
           ignore: 'pid,hostname',
         },
