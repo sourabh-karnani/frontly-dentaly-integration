@@ -225,7 +225,7 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
 
     logger.info({ business_identifier: params.business_identifier, practitionerIds }, 'Availability fetched successfully');
 
-    return res.json(availability);
+    return res.json({ ...availability, practitioner_id: practitionerIds[0] });
   } catch (error) {
     return handleError(error, res, next);
   }

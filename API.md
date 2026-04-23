@@ -155,9 +155,8 @@ curl -X GET "http://localhost:3001/dentally/availability?business_identifier=%2B
       "available_duration": 140
     }
   ],
-  "meta": {
-    "page": 1
-  }
+  "meta": { "page": 1 },
+  "practitioner_id": 1
 }
 ```
 
