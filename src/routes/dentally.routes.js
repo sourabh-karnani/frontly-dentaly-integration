@@ -61,6 +61,7 @@ const availabilitySchema = z
     practitioner_id: z.coerce.number().int().positive().optional(),
     practitioner_type: z.enum(PRACTITIONER_TYPES).optional(),
     duration: z.coerce.number().int().positive().optional(),
+    phone: z.string().optional(),
   })
   .refine((d) => d.practitioner_id !== undefined || d.practitioner_type !== undefined, {
     message: 'Either practitioner_id or practitioner_type is required',
@@ -223,9 +224,25 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
       duration: params.duration,
     });
 
+    // ── Optional patient lookup by phone ────────────────────────────────────
+    let patientId = '';
+    if (params.phone) {
+      const results = await searchPatients(practice.dentally_api_key, practice.user_agent, {
+        query: params.phone,
+        siteId: practice.dentally_site_id,
+      });
+      if (results.length > 0) {
+        patientId = results[0].id;
+        logger.info({ patientId, phone: params.phone }, 'Availability: patient matched by phone');
+      } else {
+        logger.info({ phone: params.phone }, 'Availability: no patient found for phone');
+      }
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     logger.info({ business_identifier: params.business_identifier, practitionerIds }, 'Availability fetched successfully');
 
-    return res.json({ ...availability, practitioner_id: practitionerIds[0] });
+    return res.json({ ...availability, practitioner_id: practitionerIds[0], patient_id: patientId });
   } catch (error) {
     return handleError(error, res, next);
   }
@@ -349,7 +366,7 @@ router.post('/register-patient', requireApiKey, async (req, res, next) => {
 
     const practice = await getPracticeConfig(params.business_identifier);
 
-    const paymentPlanId = await getFirstPaymentPlan(practice.dentally_api_key, practice.user_agent);
+    const paymentPlanId = await getSiteDefaultPaymentPlanId(practice.dentally_api_key, practice.user_agent, practice.dentally_site_id);
 
     const patient = await registerPatient(practice.dentally_api_key, practice.user_agent, {
       title:        params.title,

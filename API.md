@@ -130,12 +130,13 @@ x-api-key: <API_KEY>
 | `practitioner_id` | integer | ✅ or `practitioner_type` | Dentally practitioner ID. If provided, skips practitioner lookup and round robin |
 | `practitioner_type` | string | ✅ or `practitioner_id` | `"dentist"` \| `"hygienist"` \| `"therapist"`. Resolved via Dentally, round robin applied |
 | `duration` | integer | ❌ | Minimum slot duration in minutes. Defaults to practice minimum (usually 5 min) |
+| `phone` | string | ❌ | If provided, searches for a matching patient by phone. Returns `patient_id` (integer) if found, or `""` if not |
 
 > Either `practitioner_id` or `practitioner_type` must be provided, not neither.
 
-**Example — by type**
+**Example — by type with phone lookup**
 ```bash
-curl -X GET "http://localhost:3001/dentally/availability?business_identifier=%2B447911123456&practitioner_type=dentist&start_time=2026-05-01T09%3A00%3A00Z&finish_time=2026-05-07T17%3A00%3A00Z&duration=30" \
+curl -X GET "http://localhost:3001/dentally/availability?business_identifier=%2B447911123456&practitioner_type=dentist&start_time=2026-05-01T09%3A00%3A00Z&finish_time=2026-05-07T17%3A00%3A00Z&duration=30&phone=07123456789" \
   -H "x-api-key: your-api-key"
 ```
 
@@ -156,8 +157,12 @@ curl -X GET "http://localhost:3001/dentally/availability?business_identifier=%2B
     }
   ],
   "meta": { "page": 1 },
-  "practitioner_id": 1
+  "practitioner_id": 1,
+  "patient_id": 1001
 }
+```
+
+> `patient_id` is always present. It is the matched patient's integer ID when `phone` was provided and a match was found, or `""` (empty string) when `phone` was not provided or no match was found.
 ```
 
 **Response `404`** — no practitioners found for type
