@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import logger from './config/logger.js';
 import { errorHandler } from './middlewares/errorHandler.js';
 import { requestPayloadLogger } from './middlewares/requestPayloadLogger.js';
+import { recordRequest } from './metrics/tracker.js';
 import dentallyRoutes from './routes/dentally.routes.js';
 import businessRoutes from './routes/business.routes.js';
 
@@ -37,13 +38,22 @@ app.use((req, res, next) => {
   const start = Date.now();
 
   res.on('finish', () => {
-    const duration = Date.now() - start;
-    const logLevel = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
+    const duration_ms = Date.now() - start;
+    const { statusCode } = res;
+    const logLevel = statusCode >= 500 ? 'error' : statusCode >= 400 ? 'warn' : 'info';
 
     logger[logLevel](
-      { method: req.method, path: req.path, statusCode: res.statusCode, duration, ip: req.ip },
-      'HTTP request'
+      {
+        method: req.method,
+        route: (req.baseUrl ?? '') + (req.route?.path ?? req.path),
+        status_code: statusCode,
+        duration_ms,
+        ip: req.ip,
+      },
+      'request completed'
     );
+
+    recordRequest(statusCode, duration_ms);
   });
 
   next();

@@ -3,6 +3,7 @@ import app from './app.js';
 import logger from './config/logger.js';
 import env from './config/env.js';
 import { connectMongo } from './config/db.js';
+import { startMetricsReporter } from './metrics/tracker.js';
 
 const server = http.createServer(app);
 
@@ -31,6 +32,7 @@ const start = async () => {
 
     server.listen(env.port, () => {
       logger.info({ port: env.port, env: env.nodeEnv }, 'Frontly Dentally Service started successfully');
+      startMetricsReporter();
       logger.info(`Health check:         GET  http://localhost:${env.port}/health`);
       logger.info(`Get availability:     GET  http://localhost:${env.port}/dentally/availability`);
       logger.info(`Book appointment:     POST http://localhost:${env.port}/dentally/book`);
