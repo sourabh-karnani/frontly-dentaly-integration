@@ -1,6 +1,7 @@
 import env from '../config/env.js';
 import logger from '../config/logger.js';
 import Practice from '../models/Practice.js';
+import RoundRobinCounter from '../models/RoundRobinCounter.js';
 
 const BASE_URL = 'https://api.sandbox.dentally.co';
 
@@ -15,6 +16,42 @@ export class DentallyApiError extends Error {
     this.statusCode = statusCode;
     this.code = code;
   }
+}
+
+/**
+ * Map a 4xx Dentally error body to a typed { code, message, statusCode } so consumers get an
+ * actionable signal instead of a generic "Dentally API Error". Dentally returns errors as:
+ *   { error: { type: "invalid_request_error", message: "...", params: {field:[reason,...]} } }
+ *
+ * The `params` object carries the real reason. We translate the most common ones into codes
+ * the LLM tool handlers (calendar-tools-dentally.js) already branch on.
+ */
+function classifyDentallyBookingError(status, body) {
+  const params = body?.error?.params || body?.params || {};
+  const upstreamMessage = body?.error?.message || body?.message;
+  const flatten = Object.entries(params).flatMap(([field, msgs]) =>
+    (Array.isArray(msgs) ? msgs : [msgs]).map((m) => `${field}: ${m}`)
+  );
+  const joined = flatten.join(' | ').toLowerCase();
+
+  if (/has at least one existing appointment|already.*book|existing appointment/.test(joined)) {
+    return { code: 'TIME_SLOT_ALREADY_BOOKED', statusCode: 409, message: 'This time slot is already booked' };
+  }
+  if (/past|cannot be in the past|must be in the future/.test(joined)) {
+    return { code: 'PAST_TIME_NOT_ALLOWED', statusCode: 400, message: 'Appointment time cannot be in the past' };
+  }
+  if (/outside.*business hours|outside.*hours|not within working|outside working/.test(joined)) {
+    return { code: 'OUTSIDE_BUSINESS_HOURS', statusCode: 400, message: 'Appointment is outside business hours' };
+  }
+  if (/must be greater than 24 hours|must be less than|finish_time/.test(joined)) {
+    return { code: 'VALIDATION_ERROR', statusCode: 400, message: upstreamMessage || flatten.join('; ') || 'Validation failed' };
+  }
+  // Fallback: surface the real reason if we have one
+  return {
+    code: 'DENTALLY_API_ERROR',
+    statusCode: status,
+    message: flatten.length ? flatten.join('; ') : (upstreamMessage || 'Failed to book appointment in Dentally'),
+  };
 }
 
 // ============================================================================
@@ -80,6 +117,28 @@ async function dentallyFetch(operation, url, apiKey, userAgent, init = {}) {
 }
 
 // ============================================================================
+// Round-Robin Counter (MongoDB-backed — survives restarts)
+// ============================================================================
+
+/**
+ * Atomically increment a per-key counter and return the picked element from `ids`.
+ * Counter persists in MongoDB (`round_robin_counters` collection), so picks are
+ * stable across service restarts and multiple process replicas.
+ */
+export async function pickRoundRobin(key, ids) {
+  if (!Array.isArray(ids) || ids.length === 0) {
+    throw new Error('pickRoundRobin: ids must be a non-empty array');
+  }
+  const doc = await RoundRobinCounter.findOneAndUpdate(
+    { key },
+    { $inc: { count: 1 } },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  );
+  const idx = (doc.count - 1) % ids.length;
+  return ids[idx];
+}
+
+// ============================================================================
 // Practitioner Endpoints
 // ============================================================================
 
@@ -118,7 +177,8 @@ export async function getAvailability(apiKey, userAgent, { practitionerIds, star
 
   if (!ok) {
     logger.error({ practitionerIds, status, body: data }, 'Dentally get availability failed');
-    throw new DentallyApiError(status, (data && data.message) || 'Failed to fetch availability from Dentally');
+    const classified = classifyDentallyBookingError(status, data);
+    throw new DentallyApiError(classified.statusCode, classified.message, classified.code);
   }
 
   return data;
@@ -155,7 +215,8 @@ export async function updateAppointment(apiKey, userAgent, appointmentId, fields
 
   if (!ok) {
     logger.error({ appointmentId, fields, status, body: data }, 'Dentally update appointment failed');
-    throw new DentallyApiError(status, (data && data.message) || 'Failed to update appointment in Dentally');
+    const classified = classifyDentallyBookingError(status, data);
+    throw new DentallyApiError(classified.statusCode, classified.message, classified.code);
   }
 
   return data;
@@ -187,7 +248,8 @@ export async function bookAppointment(apiKey, userAgent, { startTime, finishTime
 
   if (!ok) {
     logger.error({ practitionerId, status, body: data }, 'Dentally book appointment failed');
-    throw new DentallyApiError(status, (data && data.message) || 'Failed to book appointment in Dentally');
+    const classified = classifyDentallyBookingError(status, data);
+    throw new DentallyApiError(classified.statusCode, classified.message, classified.code);
   }
 
   return data;
@@ -220,11 +282,15 @@ export async function getSiteDefaultPaymentPlanId(apiKey, userAgent, siteId) {
 // ============================================================================
 
 export async function searchPatients(apiKey, userAgent, { query, siteId }) {
-  const params = new URLSearchParams({ query });
+  // Dentally's ?query= returns 0 phone matches when the value contains a literal '+'
+  // (URLSearchParams encodes '+' as '%2B', which Dentally treats as a non-digit and
+  // breaks phone matching). Strip a leading '+' so phone queries work consistently.
+  const sanitizedQuery = typeof query === 'string' && query.startsWith('+') ? query.slice(1) : query;
+
+  const params = new URLSearchParams({ query: sanitizedQuery });
   if (siteId) params.set('site_id', siteId);
 
   const url = `${BASE_URL}/v1/patients?${params}`;
-  console.log(" ----------- URL : ", url)
   const { ok, status, data } = await dentallyFetch('searchPatients', url, apiKey, userAgent);
 
   if (!ok) {
@@ -233,6 +299,59 @@ export async function searchPatients(apiKey, userAgent, { query, siteId }) {
   }
 
   return data?.patients ?? [];
+}
+
+/**
+ * Look up a single patient by name. When multiple patients match (e.g. duplicate test
+ * patients created by historical placeholder logic), pick the most recently updated one
+ * — older duplicates are usually stale placeholders, so the freshest record is the most
+ * likely "real" patient. Returns null if nothing matched.
+ */
+export async function findPatientByName(apiKey, userAgent, { name, siteId }) {
+  const results = await searchPatients(apiKey, userAgent, { query: name, siteId });
+  if (results.length === 0) return null;
+  if (results.length === 1) return results[0];
+
+  const ts = (p) => {
+    const t = Date.parse(p.updated_at || p.created_at || '');
+    return Number.isFinite(t) ? t : 0;
+  };
+  return [...results].sort((a, b) => ts(b) - ts(a))[0];
+}
+
+/**
+ * Look up a single patient by phone number.
+ *
+ * Multiple Dentally patients can share normalised phone fragments (real patient + leftover
+ * placeholders), so this helper prefers a patient whose actual mobile/home/work phone digits
+ * match the searched phone exactly. Falls back to the first result if no exact digit match.
+ *
+ * @returns the matched patient object, or null if nothing matched.
+ */
+export async function findPatientByPhone(apiKey, userAgent, { phone, siteId }) {
+  // Strip all non-digit characters before searching. Dentally's ?query= rejects
+  // literal '+', spaces, dashes, brackets, etc. as phone-match characters,
+  // so a digits-only query is the most reliable lookup form.
+  const searchedDigits = String(phone).replace(/\D/g, '');
+  if (!searchedDigits) return null;
+
+  const results = await searchPatients(apiKey, userAgent, { query: searchedDigits, siteId });
+  if (results.length === 0) return null;
+
+  const phoneDigits = (p) =>
+    [p.mobile_phone, p.home_phone, p.work_phone]
+      .filter(Boolean)
+      .map((f) => String(f).replace(/\D/g, ''));
+
+  const exact = results.find((p) => phoneDigits(p).some((d) => d === searchedDigits));
+  if (exact) return exact;
+
+  const suffix = results.find((p) =>
+    phoneDigits(p).some((d) => d.endsWith(searchedDigits) || searchedDigits.endsWith(d))
+  );
+  if (suffix) return suffix;
+
+  return results[0];
 }
 
 export async function updatePatient(apiKey, userAgent, patientId, fields) {

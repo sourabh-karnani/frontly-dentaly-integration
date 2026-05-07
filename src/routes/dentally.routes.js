@@ -9,7 +9,9 @@ import {
   listPatientAppointments,
   updateAppointment,
   bookAppointment,
-  searchPatients,
+  findPatientByPhone,
+  findPatientByName,
+  pickRoundRobin,
   getSiteDefaultPaymentPlanId,
   registerPatient,
   updatePatient,
@@ -17,20 +19,6 @@ import {
 } from '../services/dentally.service.js';
 
 const router = Router();
-
-// ============================================================================
-// Round Robin State (in-memory, resets on restart)
-// Key: `${frontly_practice_id}:${practitioner_type}` → next index
-// ============================================================================
-
-const rrCounters = new Map();
-
-function pickRoundRobin(key, ids) {
-  const idx = rrCounters.get(key) ?? 0;
-  const picked = ids[idx % ids.length];
-  rrCounters.set(key, idx + 1);
-  return picked;
-}
 
 // ============================================================================
 // Helpers
@@ -210,9 +198,10 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
         });
       }
 
-      // Round robin: pick one practitioner per request to keep availability slots attributable
+      // Round robin: pick one practitioner per request to keep availability slots attributable.
+      // Counter is persisted in MongoDB so picks survive service restarts.
       const rrKey = `${practice.frontly_practice_id}:${params.practitioner_type}`;
-      const pickedId = pickRoundRobin(rrKey, allIds);
+      const pickedId = await pickRoundRobin(rrKey, allIds);
       practitionerIds = [pickedId];
       logger.info({ rrKey, allIds, pickedId }, 'Round robin practitioner selected');
     }
@@ -227,12 +216,12 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
     // ── Optional patient lookup by phone ────────────────────────────────────
     let patientId = '';
     if (params.phone) {
-      const results = await searchPatients(practice.dentally_api_key, practice.user_agent, {
-        query: params.phone,
+      const match = await findPatientByPhone(practice.dentally_api_key, practice.user_agent, {
+        phone: params.phone,
         siteId: practice.dentally_site_id,
       });
-      if (results.length > 0) {
-        patientId = results[0].id;
+      if (match) {
+        patientId = match.id;
         logger.info({ patientId, phone: params.phone }, 'Availability: patient matched by phone');
       } else {
         logger.info({ phone: params.phone }, 'Availability: no patient found for phone');
@@ -266,33 +255,30 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
 router.post('/book', requireApiKey, async (req, res, next) => {
   try {
     const params = bookSchema.parse(req.body);
-    console.log("------------- PHONE : --------", params.phone)
     const practice = await getPracticeConfig(params.business_identifier);
 
     // ── Patient lookup ──────────────────────────────────────────────────────
     let patientId;
 
     if (params.phone) {
-      const results = await searchPatients(practice.dentally_api_key, practice.user_agent, {
-        query: params.phone,
+      const match = await findPatientByPhone(practice.dentally_api_key, practice.user_agent, {
+        phone: params.phone,
         siteId: practice.dentally_site_id,
       });
-      if (results.length > 0) {
-        patientId = results[0].id;
+      if (match) {
+        patientId = match.id;
         logger.info({ patientId, phone: params.phone }, 'Patient matched by phone');
       }
     }
 
     if (patientId === undefined && params.name) {
-      const results = await searchPatients(practice.dentally_api_key, practice.user_agent, {
-        query: params.name,
+      const match = await findPatientByName(practice.dentally_api_key, practice.user_agent, {
+        name: params.name,
         siteId: practice.dentally_site_id,
       });
-      if (results.length === 1) {
-        patientId = results[0].id;
+      if (match) {
+        patientId = match.id;
         logger.info({ patientId, name: params.name }, 'Patient matched by name');
-      } else if (results.length > 1) {
-        logger.info({ name: params.name, count: results.length }, 'Multiple patients matched by name — booking without patient_id');
       }
     }
 
@@ -320,6 +306,33 @@ router.post('/book', requireApiKey, async (req, res, next) => {
       logger.info({ patientId, firstName, lastName }, 'Placeholder patient created');
     }
     // ────────────────────────────────────────────────────────────────────────
+
+    // ── Idempotency: short-circuit if the patient already has an active booking
+    // at the same start_time + practitioner_id (avoids duplicate-booking errors
+    // from upstream Dentally on retries / parallel LLM turns).
+    try {
+      const existing = await listPatientAppointments(practice.dentally_api_key, practice.user_agent, {
+        patientId,
+        siteId: practice.dentally_site_id,
+      });
+      const existingItems = existing?.appointments || [];
+      const startEpoch = Date.parse(params.start_time);
+      const dup = existingItems.find((a) => {
+        if ((a.state || '').toLowerCase() === 'cancelled') return false;
+        if (Date.parse(a.start_time) !== startEpoch) return false;
+        return Number(a.practitioner_id) === Number(params.practitioner_id);
+      });
+      if (dup) {
+        logger.info(
+          { patientId, appointment_id: dup.id, start_time: dup.start_time, practitioner_id: dup.practitioner_id },
+          'Booking idempotency hit — returning existing appointment instead of re-booking'
+        );
+        return res.status(200).json({ appointment: dup, patient_id: patientId, already_booked: true });
+      }
+    } catch (lookupErr) {
+      // Lookup failure shouldn't block booking — log and continue to bookAppointment
+      logger.warn({ err: lookupErr.message }, 'Idempotency pre-check failed — continuing with booking');
+    }
 
     const appointment = await bookAppointment(practice.dentally_api_key, practice.user_agent, {
       startTime:      params.start_time,
@@ -413,26 +426,24 @@ router.get('/appointments', requireApiKey, async (req, res, next) => {
     let patientId;
 
     if (params.phone) {
-      const results = await searchPatients(practice.dentally_api_key, practice.user_agent, {
-        query: params.phone,
+      const match = await findPatientByPhone(practice.dentally_api_key, practice.user_agent, {
+        phone: params.phone,
         siteId: practice.dentally_site_id,
       });
-      if (results.length > 0) {
-        patientId = results[0].id;
+      if (match) {
+        patientId = match.id;
         logger.info({ patientId, phone: params.phone }, 'Patient matched by phone');
       }
     }
 
     if (patientId === undefined && params.name) {
-      const results = await searchPatients(practice.dentally_api_key, practice.user_agent, {
-        query: params.name,
+      const match = await findPatientByName(practice.dentally_api_key, practice.user_agent, {
+        name: params.name,
         siteId: practice.dentally_site_id,
       });
-      if (results.length === 1) {
-        patientId = results[0].id;
+      if (match) {
+        patientId = match.id;
         logger.info({ patientId, name: params.name }, 'Patient matched by name');
-      } else if (results.length > 1) {
-        logger.info({ name: params.name, count: results.length }, 'Multiple patients matched — cannot determine unique patient');
       }
     }
 
@@ -569,26 +580,24 @@ router.post('/update-patient', requireApiKey, async (req, res, next) => {
     let patientId;
 
     if (params.phone) {
-      const results = await searchPatients(practice.dentally_api_key, practice.user_agent, {
-        query: params.phone,
+      const match = await findPatientByPhone(practice.dentally_api_key, practice.user_agent, {
+        phone: params.phone,
         siteId: practice.dentally_site_id,
       });
-      if (results.length > 0) {
-        patientId = results[0].id;
+      if (match) {
+        patientId = match.id;
         logger.info({ patientId, phone: params.phone }, 'Patient matched by phone');
       }
     }
 
     if (patientId === undefined && params.name) {
-      const results = await searchPatients(practice.dentally_api_key, practice.user_agent, {
-        query: params.name,
+      const match = await findPatientByName(practice.dentally_api_key, practice.user_agent, {
+        name: params.name,
         siteId: practice.dentally_site_id,
       });
-      if (results.length === 1) {
-        patientId = results[0].id;
+      if (match) {
+        patientId = match.id;
         logger.info({ patientId, name: params.name }, 'Patient matched by name');
-      } else if (results.length > 1) {
-        logger.info({ name: params.name, count: results.length }, 'Multiple patients matched — cannot determine unique patient');
       }
     }
 
