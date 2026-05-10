@@ -4,6 +4,7 @@ import logger from '../config/logger.js';
 import { requireApiKey } from '../middlewares/auth.js';
 import {
   getPracticeConfig,
+  getBaseUrl,
   getPractitionersByRole,
   getAvailability,
   listPatientAppointments,
@@ -176,6 +177,7 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
     const params = availabilitySchema.parse(req.query);
 
     const practice = await getPracticeConfig(params.business_identifier);
+    const baseUrl = getBaseUrl(practice.frontly_practice_id);
 
     let practitionerIds;
 
@@ -185,6 +187,7 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
       const allIds = await getPractitionersByRole(
         practice.dentally_api_key,
         practice.user_agent,
+        baseUrl,
         practice.dentally_site_id,
         params.practitioner_type
       );
@@ -206,7 +209,7 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
       logger.info({ rrKey, allIds, pickedId }, 'Round robin practitioner selected');
     }
 
-    const availability = await getAvailability(practice.dentally_api_key, practice.user_agent, {
+    const availability = await getAvailability(practice.dentally_api_key, practice.user_agent, baseUrl, {
       practitionerIds,
       startTime: params.start_time,
       finishTime: params.finish_time,
@@ -216,7 +219,7 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
     // ── Optional patient lookup by phone ────────────────────────────────────
     let patientId = '';
     if (params.phone) {
-      const match = await findPatientByPhone(practice.dentally_api_key, practice.user_agent, {
+      const match = await findPatientByPhone(practice.dentally_api_key, practice.user_agent, baseUrl, {
         phone: params.phone,
         siteId: practice.dentally_site_id,
       });
@@ -256,12 +259,13 @@ router.post('/book', requireApiKey, async (req, res, next) => {
   try {
     const params = bookSchema.parse(req.body);
     const practice = await getPracticeConfig(params.business_identifier);
+    const baseUrl = getBaseUrl(practice.frontly_practice_id);
 
     // ── Patient lookup ──────────────────────────────────────────────────────
     let patientId;
 
     if (params.phone) {
-      const match = await findPatientByPhone(practice.dentally_api_key, practice.user_agent, {
+      const match = await findPatientByPhone(practice.dentally_api_key, practice.user_agent, baseUrl, {
         phone: params.phone,
         siteId: practice.dentally_site_id,
       });
@@ -272,7 +276,7 @@ router.post('/book', requireApiKey, async (req, res, next) => {
     }
 
     if (patientId === undefined && params.name) {
-      const match = await findPatientByName(practice.dentally_api_key, practice.user_agent, {
+      const match = await findPatientByName(practice.dentally_api_key, practice.user_agent, baseUrl, {
         name: params.name,
         siteId: practice.dentally_site_id,
       });
@@ -287,9 +291,9 @@ router.post('/book', requireApiKey, async (req, res, next) => {
       logger.info({ phone: params.phone, name: params.name }, 'No patient match — creating placeholder patient');
 
       const { firstName, lastName } = splitName(params.name);
-      const paymentPlanId = await getSiteDefaultPaymentPlanId(practice.dentally_api_key, practice.user_agent, practice.dentally_site_id);
+      const paymentPlanId = await getSiteDefaultPaymentPlanId(practice.dentally_api_key, practice.user_agent, baseUrl, practice.dentally_site_id);
 
-      const newPatient = await registerPatient(practice.dentally_api_key, practice.user_agent, {
+      const newPatient = await registerPatient(practice.dentally_api_key, practice.user_agent, baseUrl, {
         title:        'Mr',
         firstName,
         lastName,
@@ -311,7 +315,7 @@ router.post('/book', requireApiKey, async (req, res, next) => {
     // at the same start_time + practitioner_id (avoids duplicate-booking errors
     // from upstream Dentally on retries / parallel LLM turns).
     try {
-      const existing = await listPatientAppointments(practice.dentally_api_key, practice.user_agent, {
+      const existing = await listPatientAppointments(practice.dentally_api_key, practice.user_agent, baseUrl, {
         patientId,
         siteId: practice.dentally_site_id,
       });
@@ -334,7 +338,7 @@ router.post('/book', requireApiKey, async (req, res, next) => {
       logger.warn({ err: lookupErr.message }, 'Idempotency pre-check failed — continuing with booking');
     }
 
-    const appointment = await bookAppointment(practice.dentally_api_key, practice.user_agent, {
+    const appointment = await bookAppointment(practice.dentally_api_key, practice.user_agent, baseUrl, {
       startTime:      params.start_time,
       finishTime:     params.finish_time,
       practitionerId: params.practitioner_id,
@@ -378,10 +382,11 @@ router.post('/register-patient', requireApiKey, async (req, res, next) => {
     const params = registerPatientSchema.parse(req.body);
 
     const practice = await getPracticeConfig(params.business_identifier);
+    const baseUrl = getBaseUrl(practice.frontly_practice_id);
 
-    const paymentPlanId = await getSiteDefaultPaymentPlanId(practice.dentally_api_key, practice.user_agent, practice.dentally_site_id);
+    const paymentPlanId = await getSiteDefaultPaymentPlanId(practice.dentally_api_key, practice.user_agent, baseUrl, practice.dentally_site_id);
 
-    const patient = await registerPatient(practice.dentally_api_key, practice.user_agent, {
+    const patient = await registerPatient(practice.dentally_api_key, practice.user_agent, baseUrl, {
       title:        params.title,
       firstName:    params.first_name,
       lastName:     params.last_name,
@@ -421,12 +426,13 @@ router.get('/appointments', requireApiKey, async (req, res, next) => {
     const params = listAppointmentsSchema.parse(req.query);
 
     const practice = await getPracticeConfig(params.business_identifier);
+    const baseUrl = getBaseUrl(practice.frontly_practice_id);
 
     // ── Patient lookup (no placeholder creation) ────────────────────────────
     let patientId;
 
     if (params.phone) {
-      const match = await findPatientByPhone(practice.dentally_api_key, practice.user_agent, {
+      const match = await findPatientByPhone(practice.dentally_api_key, practice.user_agent, baseUrl, {
         phone: params.phone,
         siteId: practice.dentally_site_id,
       });
@@ -437,7 +443,7 @@ router.get('/appointments', requireApiKey, async (req, res, next) => {
     }
 
     if (patientId === undefined && params.name) {
-      const match = await findPatientByName(practice.dentally_api_key, practice.user_agent, {
+      const match = await findPatientByName(practice.dentally_api_key, practice.user_agent, baseUrl, {
         name: params.name,
         siteId: practice.dentally_site_id,
       });
@@ -457,7 +463,7 @@ router.get('/appointments', requireApiKey, async (req, res, next) => {
     }
     // ────────────────────────────────────────────────────────────────────────
 
-    const appointments = await listPatientAppointments(practice.dentally_api_key, practice.user_agent, {
+    const appointments = await listPatientAppointments(practice.dentally_api_key, practice.user_agent, baseUrl, {
       patientId,
       siteId: practice.dentally_site_id,
     });
@@ -487,6 +493,7 @@ router.post('/reschedule', requireApiKey, async (req, res, next) => {
     const params = rescheduleSchema.parse(req.body);
 
     const practice = await getPracticeConfig(params.business_identifier);
+    const baseUrl = getBaseUrl(practice.frontly_practice_id);
 
     const fields = {
       start_time:  params.start_time,
@@ -497,6 +504,7 @@ router.post('/reschedule', requireApiKey, async (req, res, next) => {
     const appointment = await updateAppointment(
       practice.dentally_api_key,
       practice.user_agent,
+      baseUrl,
       params.appointment_id,
       fields
     );
@@ -525,10 +533,12 @@ router.post('/cancel', requireApiKey, async (req, res, next) => {
     const params = cancelSchema.parse(req.body);
 
     const practice = await getPracticeConfig(params.business_identifier);
+    const baseUrl = getBaseUrl(practice.frontly_practice_id);
 
     const appointment = await updateAppointment(
       practice.dentally_api_key,
       practice.user_agent,
+      baseUrl,
       params.appointment_id,
       { state: 'Cancelled' }
     );
@@ -575,12 +585,13 @@ router.post('/update-patient', requireApiKey, async (req, res, next) => {
     const params = updatePatientSchema.parse(req.body);
 
     const practice = await getPracticeConfig(params.business_identifier);
+    const baseUrl = getBaseUrl(practice.frontly_practice_id);
 
     // ── Patient lookup (no placeholder creation) ────────────────────────────
     let patientId;
 
     if (params.phone) {
-      const match = await findPatientByPhone(practice.dentally_api_key, practice.user_agent, {
+      const match = await findPatientByPhone(practice.dentally_api_key, practice.user_agent, baseUrl, {
         phone: params.phone,
         siteId: practice.dentally_site_id,
       });
@@ -591,7 +602,7 @@ router.post('/update-patient', requireApiKey, async (req, res, next) => {
     }
 
     if (patientId === undefined && params.name) {
-      const match = await findPatientByName(practice.dentally_api_key, practice.user_agent, {
+      const match = await findPatientByName(practice.dentally_api_key, practice.user_agent, baseUrl, {
         name: params.name,
         siteId: practice.dentally_site_id,
       });
@@ -622,7 +633,7 @@ router.post('/update-patient', requireApiKey, async (req, res, next) => {
     }
     if (params.gender !== undefined) fields.gender = params.gender === 'male';
 
-    const patient = await updatePatient(practice.dentally_api_key, practice.user_agent, patientId, fields);
+    const patient = await updatePatient(practice.dentally_api_key, practice.user_agent, baseUrl, patientId, fields);
 
     logger.info(
       { business_identifier: params.business_identifier, patientId, updatedFields: Object.keys(fields) },

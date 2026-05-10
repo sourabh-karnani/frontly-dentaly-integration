@@ -3,7 +3,17 @@ import logger from '../config/logger.js';
 import Practice from '../models/Practice.js';
 import RoundRobinCounter from '../models/RoundRobinCounter.js';
 
-const BASE_URL = 'https://api.sandbox.dentally.co';
+const SANDBOX_URL = 'https://api.sandbox.dentally.co';
+const PRODUCTION_URL = 'https://api.dentally.co';
+
+const PRODUCTION_PRACTICE_IDS = [
+  // Add frontly_practice_id strings here for practices that should hit production
+  // e.g. 'practice_001',
+];
+
+export function getBaseUrl(frontlyPracticeId) {
+  return PRODUCTION_PRACTICE_IDS.includes(frontlyPracticeId) ? PRODUCTION_URL : SANDBOX_URL;
+}
 
 // ============================================================================
 // Error Class
@@ -142,8 +152,8 @@ export async function pickRoundRobin(key, ids) {
 // Practitioner Endpoints
 // ============================================================================
 
-export async function getPractitionersByRole(apiKey, userAgent, siteId, role) {
-  const url = `${BASE_URL}/v1/practitioners?site_id=${encodeURIComponent(siteId)}`;
+export async function getPractitionersByRole(apiKey, userAgent, baseUrl, siteId, role) {
+  const url = `${baseUrl}/v1/practitioners?site_id=${encodeURIComponent(siteId)}`;
 
   const { ok, status, data } = await dentallyFetch('getPractitionersByRole', url, apiKey, userAgent);
 
@@ -162,7 +172,7 @@ export async function getPractitionersByRole(apiKey, userAgent, siteId, role) {
 // Appointment Endpoints
 // ============================================================================
 
-export async function getAvailability(apiKey, userAgent, { practitionerIds, startTime, finishTime, duration }) {
+export async function getAvailability(apiKey, userAgent, baseUrl, { practitionerIds, startTime, finishTime, duration }) {
   const query = new URLSearchParams();
   for (const id of practitionerIds) {
     query.append('practitioner_ids[]', id);
@@ -171,7 +181,7 @@ export async function getAvailability(apiKey, userAgent, { practitionerIds, star
   query.set('finish_time', finishTime);
   if (duration) query.set('duration', duration);
 
-  const url = `${BASE_URL}/v1/appointments/availability?${query}`;
+  const url = `${baseUrl}/v1/appointments/availability?${query}`;
 
   const { ok, status, data } = await dentallyFetch('getAvailability', url, apiKey, userAgent);
 
@@ -184,11 +194,11 @@ export async function getAvailability(apiKey, userAgent, { practitionerIds, star
   return data;
 }
 
-export async function listPatientAppointments(apiKey, userAgent, { patientId, siteId }) {
+export async function listPatientAppointments(apiKey, userAgent, baseUrl, { patientId, siteId }) {
   const query = new URLSearchParams({ patient_id: patientId });
   if (siteId) query.set('site_id', siteId);
 
-  const url = `${BASE_URL}/v1/appointments?${query}`;
+  const url = `${baseUrl}/v1/appointments?${query}`;
 
   const { ok, status, data } = await dentallyFetch('listPatientAppointments', url, apiKey, userAgent);
 
@@ -200,10 +210,10 @@ export async function listPatientAppointments(apiKey, userAgent, { patientId, si
   return data;
 }
 
-export async function updateAppointment(apiKey, userAgent, appointmentId, fields) {
+export async function updateAppointment(apiKey, userAgent, baseUrl, appointmentId, fields) {
   const { ok, status, data } = await dentallyFetch(
     'updateAppointment',
-    `${BASE_URL}/v1/appointments/${appointmentId}`,
+    `${baseUrl}/v1/appointments/${appointmentId}`,
     apiKey,
     userAgent,
     {
@@ -222,7 +232,7 @@ export async function updateAppointment(apiKey, userAgent, appointmentId, fields
   return data;
 }
 
-export async function bookAppointment(apiKey, userAgent, { startTime, finishTime, practitionerId, reason, patientId, state, notes }) {
+export async function bookAppointment(apiKey, userAgent, baseUrl, { startTime, finishTime, practitionerId, reason, patientId, state, notes }) {
   const appointment = {
     start_time: startTime,
     finish_time: finishTime,
@@ -236,7 +246,7 @@ export async function bookAppointment(apiKey, userAgent, { startTime, finishTime
 
   const { ok, status, data } = await dentallyFetch(
     'bookAppointment',
-    `${BASE_URL}/v1/appointments`,
+    `${baseUrl}/v1/appointments`,
     apiKey,
     userAgent,
     {
@@ -259,8 +269,8 @@ export async function bookAppointment(apiKey, userAgent, { startTime, finishTime
 // Site Endpoints
 // ============================================================================
 
-export async function getSiteDefaultPaymentPlanId(apiKey, userAgent, siteId) {
-  const url = `${BASE_URL}/v1/sites/${encodeURIComponent(siteId)}`;
+export async function getSiteDefaultPaymentPlanId(apiKey, userAgent, baseUrl, siteId) {
+  const url = `${baseUrl}/v1/sites/${encodeURIComponent(siteId)}`;
 
   const { ok, status, data } = await dentallyFetch('getSiteDefaultPaymentPlanId', url, apiKey, userAgent);
 
@@ -281,7 +291,7 @@ export async function getSiteDefaultPaymentPlanId(apiKey, userAgent, siteId) {
 // Patient Endpoints
 // ============================================================================
 
-export async function searchPatients(apiKey, userAgent, { query, siteId }) {
+export async function searchPatients(apiKey, userAgent, baseUrl, { query, siteId }) {
   // Dentally's ?query= returns 0 phone matches when the value contains a literal '+'
   // (URLSearchParams encodes '+' as '%2B', which Dentally treats as a non-digit and
   // breaks phone matching). Strip a leading '+' so phone queries work consistently.
@@ -290,7 +300,7 @@ export async function searchPatients(apiKey, userAgent, { query, siteId }) {
   const params = new URLSearchParams({ query: sanitizedQuery });
   if (siteId) params.set('site_id', siteId);
 
-  const url = `${BASE_URL}/v1/patients?${params}`;
+  const url = `${baseUrl}/v1/patients?${params}`;
   const { ok, status, data } = await dentallyFetch('searchPatients', url, apiKey, userAgent);
 
   if (!ok) {
@@ -307,8 +317,8 @@ export async function searchPatients(apiKey, userAgent, { query, siteId }) {
  * — older duplicates are usually stale placeholders, so the freshest record is the most
  * likely "real" patient. Returns null if nothing matched.
  */
-export async function findPatientByName(apiKey, userAgent, { name, siteId }) {
-  const results = await searchPatients(apiKey, userAgent, { query: name, siteId });
+export async function findPatientByName(apiKey, userAgent, baseUrl, { name, siteId }) {
+  const results = await searchPatients(apiKey, userAgent, baseUrl, { query: name, siteId });
   if (results.length === 0) return null;
   if (results.length === 1) return results[0];
 
@@ -328,14 +338,14 @@ export async function findPatientByName(apiKey, userAgent, { name, siteId }) {
  *
  * @returns the matched patient object, or null if nothing matched.
  */
-export async function findPatientByPhone(apiKey, userAgent, { phone, siteId }) {
+export async function findPatientByPhone(apiKey, userAgent, baseUrl, { phone, siteId }) {
   // Strip all non-digit characters before searching. Dentally's ?query= rejects
   // literal '+', spaces, dashes, brackets, etc. as phone-match characters,
   // so a digits-only query is the most reliable lookup form.
   const searchedDigits = String(phone).replace(/\D/g, '');
   if (!searchedDigits) return null;
 
-  const results = await searchPatients(apiKey, userAgent, { query: searchedDigits, siteId });
+  const results = await searchPatients(apiKey, userAgent, baseUrl, { query: searchedDigits, siteId });
   if (results.length === 0) return null;
 
   const phoneDigits = (p) =>
@@ -354,10 +364,10 @@ export async function findPatientByPhone(apiKey, userAgent, { phone, siteId }) {
   return results[0];
 }
 
-export async function updatePatient(apiKey, userAgent, patientId, fields) {
+export async function updatePatient(apiKey, userAgent, baseUrl, patientId, fields) {
   const { ok, status, data } = await dentallyFetch(
     'updatePatient',
-    `${BASE_URL}/v1/patients/${patientId}`,
+    `${baseUrl}/v1/patients/${patientId}`,
     apiKey,
     userAgent,
     {
@@ -375,7 +385,7 @@ export async function updatePatient(apiKey, userAgent, patientId, fields) {
   return data;
 }
 
-export async function registerPatient(apiKey, userAgent, { title, firstName, lastName, dateOfBirth, gender, addressLine1, postcode, siteId, paymentPlanId, mobilePhone, emailAddress }) {
+export async function registerPatient(apiKey, userAgent, baseUrl, { title, firstName, lastName, dateOfBirth, gender, addressLine1, postcode, siteId, paymentPlanId, mobilePhone, emailAddress }) {
   const patient = {
     title,
     first_name: firstName,
@@ -394,7 +404,7 @@ export async function registerPatient(apiKey, userAgent, { title, firstName, las
 
   const { ok, status, data } = await dentallyFetch(
     'registerPatient',
-    `${BASE_URL}/v1/patients`,
+    `${baseUrl}/v1/patients`,
     apiKey,
     userAgent,
     {
