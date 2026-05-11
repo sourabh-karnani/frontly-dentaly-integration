@@ -7,7 +7,8 @@ const SANDBOX_URL = 'https://api.sandbox.dentally.co';
 const PRODUCTION_URL = 'https://api.dentally.co';
 
 const PRODUCTION_PRACTICE_IDS = [
-  'practice_003'
+  'practice_003',
+  'practice_005'
   // Add frontly_practice_id strings here for practices that should hit production
   // e.g. 'practice_001',
 ];
