@@ -1,3 +1,6 @@
 node_modules/
 .env
 *.log
+
+# allow staging branch to commit env config
+!.env.staging
