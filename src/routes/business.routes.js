@@ -19,6 +19,18 @@ const registerBusinessSchema = z.object({
   user_agent:           z.string().min(1, 'user_agent is required'),
 });
 
+// PATCH update — every field optional. Whatever is present is overwritten;
+// omitted fields keep their current value. dentally_api_key is sensitive
+// and only written when explicitly supplied, so the Frontly admin UI can
+// preserve the existing key without ever reading it back.
+const updateBusinessSchema = z.object({
+  frontly_practice_id:  z.string().min(1).optional(),
+  dentally_api_key:     z.string().min(1).optional(),
+  dentally_site_id:     z.string().min(1).optional(),
+  user_agent:           z.string().min(1).optional(),
+  isActive:             z.boolean().optional(),
+}).strict();
+
 // ============================================================================
 // Error Helper
 // ============================================================================
@@ -107,6 +119,67 @@ router.post('/register', requireApiKey, async (req, res, next) => {
         user_agent:           practice.user_agent,
         isActive:             practice.isActive,
         createdAt:            practice.createdAt,
+      },
+    });
+  } catch (error) {
+    return handleError(error, res, next);
+  }
+});
+
+/**
+ * PATCH /business/:business_identifier
+ *
+ * Updates an existing practice. All body fields are optional; the
+ * dentally_api_key is only written when explicitly supplied so the Frontly
+ * admin UI never has to round-trip the secret. Returns the updated doc
+ * (without dentally_api_key) for confirmation.
+ */
+router.patch('/:business_identifier', requireApiKey, async (req, res, next) => {
+  try {
+    const business_identifier = String(req.params.business_identifier || '').trim();
+    if (!business_identifier) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'business_identifier path param is required',
+        code: 'VALIDATION_ERROR',
+      });
+    }
+    const params = updateBusinessSchema.parse(req.body || {});
+
+    const practice = await Practice.findOne({ business_identifier });
+    if (!practice) {
+      return res.status(404).json({
+        success: false,
+        error: 'Not Found',
+        message: 'Practice not found',
+        code: 'PRACTICE_NOT_FOUND',
+      });
+    }
+
+    if (params.frontly_practice_id !== undefined) practice.frontly_practice_id = params.frontly_practice_id;
+    if (params.dentally_api_key   !== undefined) practice.dentally_api_key   = params.dentally_api_key;
+    if (params.dentally_site_id   !== undefined) practice.dentally_site_id   = params.dentally_site_id;
+    if (params.user_agent         !== undefined) practice.user_agent         = params.user_agent;
+    if (params.isActive           !== undefined) practice.isActive           = params.isActive;
+
+    await practice.save();
+
+    logger.info(
+      { business_identifier, fields: Object.keys(params) },
+      'Business updated successfully'
+    );
+
+    return res.status(200).json({
+      success: true,
+      practice: {
+        id:                   practice._id,
+        business_identifier:  practice.business_identifier,
+        frontly_practice_id:  practice.frontly_practice_id,
+        dentally_site_id:     practice.dentally_site_id,
+        user_agent:           practice.user_agent,
+        isActive:             practice.isActive,
+        updatedAt:            practice.updatedAt,
       },
     });
   } catch (error) {
