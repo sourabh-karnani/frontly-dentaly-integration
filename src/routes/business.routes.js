@@ -17,6 +17,10 @@ const registerBusinessSchema = z.object({
   dentally_api_key:     z.string().min(1, 'dentally_api_key is required'),
   dentally_site_id:     z.string().min(1, 'dentally_site_id is required'),
   user_agent:           z.string().min(1, 'user_agent is required'),
+  // When omitted the practice has no explicit production/sandbox preference
+  // and the service falls back to the legacy PRODUCTION_PRACTICE_IDS allowlist.
+  // New per-bot saves from Frontly pass `true` so production keys work by default.
+  isProduction:         z.boolean().optional(),
 });
 
 // PATCH update — every field optional. Whatever is present is overwritten;
@@ -29,6 +33,7 @@ const updateBusinessSchema = z.object({
   dentally_site_id:     z.string().min(1).optional(),
   user_agent:           z.string().min(1).optional(),
   isActive:             z.boolean().optional(),
+  isProduction:         z.boolean().optional(),
 }).strict();
 
 // ============================================================================
@@ -102,6 +107,7 @@ router.post('/register', requireApiKey, async (req, res, next) => {
       dentally_site_id:     params.dentally_site_id,
       user_agent:           params.user_agent,
       isActive:             true,
+      ...(typeof params.isProduction === 'boolean' ? { isProduction: params.isProduction } : {}),
     });
 
     logger.info(
@@ -162,6 +168,7 @@ router.patch('/:business_identifier', requireApiKey, async (req, res, next) => {
     if (params.dentally_site_id   !== undefined) practice.dentally_site_id   = params.dentally_site_id;
     if (params.user_agent         !== undefined) practice.user_agent         = params.user_agent;
     if (params.isActive           !== undefined) practice.isActive           = params.isActive;
+    if (params.isProduction       !== undefined) practice.isProduction       = params.isProduction;
 
     await practice.save();
 

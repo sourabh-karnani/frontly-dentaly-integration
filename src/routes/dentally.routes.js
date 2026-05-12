@@ -13,6 +13,7 @@ import {
   findPatientByPhone,
   findPatientByName,
   pickRoundRobin,
+  distributeSlots,
   getSiteDefaultPaymentPlanId,
   registerPatient,
   updatePatient,
@@ -177,14 +178,20 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
     const params = availabilitySchema.parse(req.query);
 
     const practice = await getPracticeConfig(params.business_identifier);
-    const baseUrl = getBaseUrl(practice.frontly_practice_id);
+    const baseUrl = getBaseUrl(practice);
 
     let practitionerIds;
+    // Snapshot of all candidates for this role — used after Dentally returns
+    // raw availability to drive per-slot RR distribution. When a caller passes
+    // practitioner_id explicitly, RR is skipped entirely.
+    let allCandidateIds = null;
+    let rrPos = null;
+    let rrKey = null;
 
     if (params.practitioner_id !== undefined) {
       practitionerIds = [params.practitioner_id];
     } else {
-      const allIds = await getPractitionersByRole(
+      allCandidateIds = await getPractitionersByRole(
         practice.dentally_api_key,
         practice.user_agent,
         baseUrl,
@@ -192,7 +199,7 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
         params.practitioner_type
       );
 
-      if (allIds.length === 0) {
+      if (allCandidateIds.length === 0) {
         return res.status(404).json({
           success: false,
           error: 'Not Found',
@@ -201,12 +208,26 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
         });
       }
 
-      // Round robin: pick one practitioner per request to keep availability slots attributable.
-      // Counter is persisted in MongoDB so picks survive service restarts.
-      const rrKey = `${practice.frontly_practice_id}:${params.practitioner_type}`;
-      const pickedId = await pickRoundRobin(rrKey, allIds);
-      practitionerIds = [pickedId];
-      logger.info({ rrKey, allIds, pickedId }, 'Round robin practitioner selected');
+      // Sort by id so the index → practitioner mapping is deterministic; an
+      // upstream practitioner-list reordering by Dentally must not silently
+      // shift the RR rotation.
+      allCandidateIds = [...allCandidateIds].sort((a, b) => Number(a) - Number(b));
+
+      // Query Dentally for ALL matching practitioners in one shot so the
+      // response exposes every free slot (not just one round-robin pick).
+      // RR happens later, per unique slot time, against this same list.
+      practitionerIds = allCandidateIds;
+
+      rrKey = `${practice.frontly_practice_id}:${params.practitioner_type}`;
+      // Advance the RR counter once per availability call. The position is
+      // applied per unique slot time below (mod the candidates available for
+      // that specific time), so single-practitioner times always surface
+      // their lone option and shared times rotate across sessions.
+      const picked = await pickRoundRobin(rrKey, allCandidateIds);
+      // pickRoundRobin returns the id at `(count-1) % len`; recover the
+      // index so we can apply the same position to per-time sublists.
+      rrPos = allCandidateIds.indexOf(picked);
+      logger.info({ rrKey, allCandidateIds, rrPos }, 'Round robin position advanced');
     }
 
     const availability = await getAvailability(practice.dentally_api_key, practice.user_agent, baseUrl, {
@@ -215,6 +236,18 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
       finishTime: params.finish_time,
       duration: params.duration,
     });
+
+    // ── Build the RR-distributed slot list ─────────────────────────────────
+    // Each entry in `slots` is one bookable starting time with the
+    // practitioner_id picked for that slot. `availability` (the original
+    // Dentally response) is preserved untouched so existing consumers
+    // (voicebot expansion logic) keep working.
+    const distributedSlots = distributeSlots(
+      availability?.availability,
+      Number(params.duration) || 30,
+      { rrPos, candidatesById: practitionerIds }
+    );
+    // ───────────────────────────────────────────────────────────────────────
 
     // ── Optional patient lookup by phone ────────────────────────────────────
     let patientId = '';
@@ -232,9 +265,22 @@ router.get('/availability', requireApiKey, async (req, res, next) => {
     }
     // ────────────────────────────────────────────────────────────────────────
 
-    logger.info({ business_identifier: params.business_identifier, practitionerIds }, 'Availability fetched successfully');
+    logger.info(
+      { business_identifier: params.business_identifier, practitionerIds, slotsReturned: distributedSlots.length },
+      'Availability fetched successfully'
+    );
 
-    return res.json({ ...availability, practitioner_id: practitionerIds[0], patient_id: patientId });
+    return res.json({
+      ...availability,
+      // New: per-slot RR-distributed list. Each {start_time, finish_time,
+      // practitioner_id} entry is one bookable start. Chat-system reads
+      // this directly; voicebot keeps using the raw `availability` blocks.
+      slots: distributedSlots,
+      // Legacy top-level practitioner_id — first slot's pick when multi.
+      // Old bot tool descriptions still reference this, so keep populated.
+      practitioner_id: distributedSlots[0]?.practitioner_id ?? practitionerIds[0],
+      patient_id: patientId,
+    });
   } catch (error) {
     return handleError(error, res, next);
   }
@@ -259,7 +305,7 @@ router.post('/book', requireApiKey, async (req, res, next) => {
   try {
     const params = bookSchema.parse(req.body);
     const practice = await getPracticeConfig(params.business_identifier);
-    const baseUrl = getBaseUrl(practice.frontly_practice_id);
+    const baseUrl = getBaseUrl(practice);
 
     // ── Patient lookup ──────────────────────────────────────────────────────
     let patientId;
@@ -382,7 +428,7 @@ router.post('/register-patient', requireApiKey, async (req, res, next) => {
     const params = registerPatientSchema.parse(req.body);
 
     const practice = await getPracticeConfig(params.business_identifier);
-    const baseUrl = getBaseUrl(practice.frontly_practice_id);
+    const baseUrl = getBaseUrl(practice);
 
     const paymentPlanId = await getSiteDefaultPaymentPlanId(practice.dentally_api_key, practice.user_agent, baseUrl, practice.dentally_site_id);
 
@@ -426,7 +472,7 @@ router.get('/appointments', requireApiKey, async (req, res, next) => {
     const params = listAppointmentsSchema.parse(req.query);
 
     const practice = await getPracticeConfig(params.business_identifier);
-    const baseUrl = getBaseUrl(practice.frontly_practice_id);
+    const baseUrl = getBaseUrl(practice);
 
     // ── Patient lookup (no placeholder creation) ────────────────────────────
     let patientId;
@@ -493,7 +539,7 @@ router.post('/reschedule', requireApiKey, async (req, res, next) => {
     const params = rescheduleSchema.parse(req.body);
 
     const practice = await getPracticeConfig(params.business_identifier);
-    const baseUrl = getBaseUrl(practice.frontly_practice_id);
+    const baseUrl = getBaseUrl(practice);
 
     const fields = {
       start_time:  params.start_time,
@@ -533,7 +579,7 @@ router.post('/cancel', requireApiKey, async (req, res, next) => {
     const params = cancelSchema.parse(req.body);
 
     const practice = await getPracticeConfig(params.business_identifier);
-    const baseUrl = getBaseUrl(practice.frontly_practice_id);
+    const baseUrl = getBaseUrl(practice);
 
     const appointment = await updateAppointment(
       practice.dentally_api_key,
@@ -585,7 +631,7 @@ router.post('/update-patient', requireApiKey, async (req, res, next) => {
     const params = updatePatientSchema.parse(req.body);
 
     const practice = await getPracticeConfig(params.business_identifier);
-    const baseUrl = getBaseUrl(practice.frontly_practice_id);
+    const baseUrl = getBaseUrl(practice);
 
     // ── Patient lookup (no placeholder creation) ────────────────────────────
     let patientId;

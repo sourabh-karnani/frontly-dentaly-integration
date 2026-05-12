@@ -36,6 +36,16 @@ const practiceSchema = new mongoose.Schema(
       default: true,
       index: true,
     },
+
+    // When set, picks the Dentally base URL: true → api.dentally.co,
+    // false → api.sandbox.dentally.co. When undefined (legacy doc), the
+    // service falls back to the hardcoded PRODUCTION_PRACTICE_IDS allowlist
+    // in dentally.service.js. New per-bot saves from the Frontly admin UI
+    // default this to true so production API keys "just work."
+    isProduction: {
+      type: Boolean,
+      default: undefined,
+    },
   },
   {
     timestamps: true,

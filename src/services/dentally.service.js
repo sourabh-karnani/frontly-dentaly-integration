@@ -6,15 +6,30 @@ import RoundRobinCounter from '../models/RoundRobinCounter.js';
 const SANDBOX_URL = 'https://api.sandbox.dentally.co';
 const PRODUCTION_URL = 'https://api.dentally.co';
 
+// Legacy fallback. Practices without an explicit `isProduction` flag are
+// routed based on this allowlist for back-compat with the original setup.
+// New practices created via the per-bot calendar modal set `isProduction`
+// directly on the Practice doc, so they bypass this list entirely.
 const PRODUCTION_PRACTICE_IDS = [
   'practice_003',
-  'practice_005'
-  // Add frontly_practice_id strings here for practices that should hit production
-  // e.g. 'practice_001',
+  'practice_005',
 ];
 
-export function getBaseUrl(frontlyPracticeId) {
-  return PRODUCTION_PRACTICE_IDS.includes(frontlyPracticeId) ? PRODUCTION_URL : SANDBOX_URL;
+/**
+ * Pick the Dentally base URL for a practice. Accepts either the full
+ * practice doc (preferred — checks its `isProduction` flag first) or the
+ * raw `frontly_practice_id` string (legacy callers — falls back to the
+ * hardcoded allowlist).
+ */
+export function getBaseUrl(practiceOrId) {
+  if (practiceOrId && typeof practiceOrId === 'object') {
+    if (typeof practiceOrId.isProduction === 'boolean') {
+      return practiceOrId.isProduction ? PRODUCTION_URL : SANDBOX_URL;
+    }
+    const fpid = practiceOrId.frontly_practice_id;
+    return PRODUCTION_PRACTICE_IDS.includes(fpid) ? PRODUCTION_URL : SANDBOX_URL;
+  }
+  return PRODUCTION_PRACTICE_IDS.includes(practiceOrId) ? PRODUCTION_URL : SANDBOX_URL;
 }
 
 // ============================================================================
@@ -137,6 +152,99 @@ async function dentallyFetch(operation, url, apiKey, userAgent, init = {}) {
  * Counter persists in MongoDB (`round_robin_counters` collection), so picks are
  * stable across service restarts and multiple process replicas.
  */
+/**
+ * Expand Dentally's per-practitioner availability blocks into starting
+ * positions of `slotMinutes`, then for each unique start_time pick exactly
+ * one practitioner via round-robin.
+ *
+ * Inputs:
+ *   - `availability`: Dentally's `[{ start_time, finish_time, practitioner_id, ... }]`
+ *     array. Each entry is one practitioner's continuous free window.
+ *   - `slotMinutes`: the duration the caller asked for (`duration` param). All
+ *     emitted slots share this duration.
+ *   - `ctx.rrPos`: integer position from `pickRoundRobin` for this call.
+ *     `null` skips RR (used when caller passed a specific practitioner_id).
+ *   - `ctx.candidatesById`: full set of practitioner IDs the call covers, in
+ *     deterministic order. RR-mods against per-time sublists.
+ *
+ * Output: one entry per unique starting time, `{ start_time, finish_time,
+ * practitioner_id }`. Single-practitioner times always surface that lone
+ * practitioner; shared times rotate by RR position across sessions.
+ *
+ * Each slot's `finish_time` is `start_time + slotMinutes`, so the chat layer
+ * doesn't need to compute boundaries downstream.
+ */
+export function distributeSlots(availability, slotMinutes, ctx = {}) {
+  if (!Array.isArray(availability) || availability.length === 0) return [];
+  const stepMs = (Number(slotMinutes) || 30) * 60 * 1000;
+  if (stepMs <= 0) return [];
+
+  // Map: slot_start_iso → { finish_time, practitioners: Set<id> }
+  // The Set guarantees one practitioner isn't double-counted if Dentally
+  // returned overlapping windows for them. We stash finish_time alongside
+  // so we don't have to re-derive the offset later (preserving the wall-
+  // clock representation, not UTC).
+  const byStart = new Map();
+
+  for (const block of availability) {
+    if (!block || block.practitioner_id == null) continue;
+    const startMs = new Date(block.start_time).getTime();
+    const finishMs = new Date(block.finish_time).getTime();
+    if (!Number.isFinite(startMs) || !Number.isFinite(finishMs)) continue;
+    // Original offset, e.g. "+01:00" or "Z"
+    const offsetMatch = String(block.start_time).match(/(Z|[+-]\d{2}:?\d{2})$/);
+    const offset = offsetMatch ? offsetMatch[1] : 'Z';
+    let offsetMin = 0;
+    if (offset !== 'Z') {
+      const sign = offset[0] === '-' ? -1 : 1;
+      const clean = offset.replace(':', '').slice(1);
+      offsetMin = sign * (Number(clean.slice(0, 2)) * 60 + Number(clean.slice(2)));
+    }
+    const offsetMs = offsetMin * 60 * 1000;
+    for (let t = startMs; t + stepMs <= finishMs; t += stepMs) {
+      // The original wall-clock instant for this slot: shift UTC ms by the
+      // offset, then format. Doing the shift here (rather than parsing the
+      // start_time back from a string) ensures finish_time is wall-clock
+      // start + stepMs, not UTC start + stepMs (which would drop the offset).
+      const localStartMs = t + offsetMs;
+      const localFinishMs = localStartMs + stepMs;
+      const startIso = new Date(localStartMs).toISOString().replace('Z', offset);
+      const finishIso = new Date(localFinishMs).toISOString().replace('Z', offset);
+      let entry = byStart.get(startIso);
+      if (!entry) {
+        entry = { finish_time: finishIso, practitioners: new Set() };
+        byStart.set(startIso, entry);
+      }
+      entry.practitioners.add(Number(block.practitioner_id));
+    }
+  }
+
+  if (byStart.size === 0) return [];
+
+  // Deterministic order of starting times so the response is stable across
+  // calls and easy for downstream consumers to filter/page.
+  const startTimes = [...byStart.keys()].sort();
+  const out = [];
+  for (const startIso of startTimes) {
+    const entry = byStart.get(startIso);
+    const candidates = [...entry.practitioners].sort((a, b) => a - b);
+    let pickedId;
+    if (candidates.length === 1) {
+      pickedId = candidates[0];
+    } else if (typeof ctx.rrPos === 'number' && ctx.rrPos >= 0) {
+      pickedId = candidates[ctx.rrPos % candidates.length];
+    } else {
+      pickedId = candidates[0];
+    }
+    out.push({
+      start_time: startIso,
+      finish_time: entry.finish_time,
+      practitioner_id: pickedId,
+    });
+  }
+  return out;
+}
+
 export async function pickRoundRobin(key, ids) {
   if (!Array.isArray(ids) || ids.length === 0) {
     throw new Error('pickRoundRobin: ids must be a non-empty array');
